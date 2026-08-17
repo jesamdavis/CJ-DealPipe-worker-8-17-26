@@ -30,6 +30,66 @@ function zipCodes(value = "") {
   )];
 }
 
+function bearerToken(request) {
+  const auth = request.headers.get("authorization") || "";
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : "";
+}
+
+async function forwardToCJ(request, env) {
+  if (!env.CJ_API_TOKEN) {
+    return json({ ok: false, error: "CJ_API_TOKEN secret is not configured" }, 500);
+  }
+
+  // DealPipe already authenticates CJ calls with its CJ bearer token. Requiring
+  // the same token here keeps the relay private without adding another Railway secret.
+  if (bearerToken(request) !== env.CJ_API_TOKEN) {
+    return json({ ok: false, error: "Unauthorized" }, 401);
+  }
+
+  let body;
+  try {
+    body = await request.text();
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed.query !== "string" || !parsed.query.trim()) {
+      return json({ ok: false, error: "GraphQL query is required" }, 400);
+    }
+  } catch {
+    return json({ ok: false, error: "Invalid JSON body" }, 400);
+  }
+
+  let cjResponse;
+  try {
+    cjResponse = await fetch(CJ_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "authorization": `Bearer ${env.CJ_API_TOKEN}`,
+        "content-type": "application/json",
+        "requestor-cid": request.headers.get("requestor-cid") || CJ_COMPANY_ID,
+        "user-agent": "DealPipeIngestion/1.0",
+      },
+      body,
+    });
+  } catch (error) {
+    return json({
+      ok: false,
+      stage: "cloudflare_to_cj",
+      error: String(error?.message || error),
+    }, 502);
+  }
+
+  const text = await cjResponse.text();
+  return new Response(text, {
+    status: cjResponse.status,
+    headers: {
+      "content-type": cjResponse.headers.get("content-type") || "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-dealpipe-cj-relay": "cloudflare",
+      "x-cj-upstream-status": String(cjResponse.status),
+    },
+  });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -39,14 +99,28 @@ export default {
         ok: true,
         service: "DealPipe-CJ-Worker",
         cj_endpoint: CJ_ENDPOINT,
+        relay_endpoint: "/query",
       });
+    }
+
+    // Production relay used by DealPipe. It intentionally mirrors CJ's GraphQL
+    // POST response so DealPipe can switch egress by changing CJ_GRAPHQL_ENDPOINT.
+    if (url.pathname === "/query") {
+      if (request.method !== "POST") {
+        return json({ ok: false, error: "Method not allowed" }, 405);
+      }
+      return forwardToCJ(request, env);
     }
 
     if (url.pathname !== "/test") {
       return json({
         ok: false,
         error: "Not found",
-        endpoints: ["/health", "/test?city=Waukesha&state=WI&zip=53186"],
+        endpoints: [
+          "/health",
+          "/query",
+          "/test?city=Waukesha&state=WI&zip=53186",
+        ],
       }, 404);
     }
 
